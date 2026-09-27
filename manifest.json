@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "product": "Price CSV Guard",
+  "version": "2026-09-27.v5",
+  "artifactSha256": "9fdb24f1050c8b4f77fcc37fd622a71c1bd7f8c338b28a6d7f4b69e3479d029f",
+  "files": [
+    "index.html",
+    "LICENSE.txt",
+    "NOTICE.md",
+    "SUPPORT.md",
+    "README.md",
+    "manifest.json"
+  ]
+}

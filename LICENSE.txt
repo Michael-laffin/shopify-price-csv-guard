@@ -1,0 +1,5 @@
+Demo evaluation license
+
+Permission is granted to download and run this exact demo locally for CSV comparison and evaluation, including evaluation for business use. No permission is granted to resell or redistribute the demo or its code. Other rights are reserved, subject to applicable GitHub platform rights, which this license does not limit.
+
+The demo is not affiliated with, endorsed by, or approved by Shopify. It is provided as-is without warranty of any kind, including accuracy, fitness, or suitability for import decisions. No support, availability, or response is promised. You remain responsible for checking your own data and import process.

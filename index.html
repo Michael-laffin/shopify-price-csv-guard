@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-whSycbFAONfasEog4ZOX0ZRdxY19D7D9jN4pBYU47JU='; style-src 'sha256-tZnqjM+C3/mOcA/6oXRq+EutLIypFlaM96fv6OSq9o0='; connect-src 'none'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>Shopify Price CSV Guard — local preflight</title>
+  <style>:root { color-scheme: light; font-family: system-ui, sans-serif; color: #19322d; background: #f3f6f3; line-height: 1.55; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1080px; margin: auto; padding: 3rem 1.25rem; }
+h1 { font-size: clamp(2.1rem, 5vw, 3.6rem); line-height: 1.1; letter-spacing: -.045em; margin: .6rem 0 1.2rem; }
+h2 { font-size: 1.3rem; }
+h3 { margin-top: 2rem; }
+.eyebrow { font-size: .78rem; font-weight: 750; letter-spacing: .14em; color: #326452; }
+.lead { font-size: 1.2rem; max-width: 46rem; }
+.panel { background: white; border: 1px solid #ccd9d0; border-radius: 12px; padding: 1.5rem; margin: 1.5rem 0; }
+.notice { border-left: 4px solid #946000; padding: .75rem 1rem; background: #fff5dc; color: #593a00; }
+.file-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.25rem 0; }
+label { display: block; font-weight: 650; border: 1px dashed #789889; border-radius: 8px; padding: 1rem; min-width: 0; }
+label span { display: block; font-size: .85rem; font-weight: 400; color: #4d645a; }
+input { display: block; max-width: 100%; margin: .75rem 0; font: inherit; font-size: .9rem; }
+button { font: inherit; font-weight: 650; cursor: pointer; background: #20583f; color: white; border: 1px solid #20583f; padding: .65rem 1rem; border-radius: 6px; }
+button.secondary { color: #20583f; background: white; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+:focus-visible { outline: 3px solid #2778c4; outline-offset: 3px; }
+.actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+.hint { font-size: .85rem; color: #4d645a; }
+#error, #truncation, .blocked { color: #84251e; background: #fff0ed; padding: 1rem; border-left: 4px solid #a72e24; }
+#status { font-weight: 650; }
+#summary { font-size: 1.1rem; font-weight: 650; }
+#findings { padding-left: 1.5rem; }
+#findings li { padding: .6rem; margin: .6rem 0; border: 1px solid #d9deda; border-radius: 5px; overflow-wrap: anywhere; }
+#findings pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+caption { text-align: left; color: #4d645a; padding-bottom: .5rem; }
+th, td { text-align: left; vertical-align: top; padding: .7rem; border-bottom: 1px solid #d9deda; overflow-wrap: anywhere; max-width: 22rem; }
+th { background: #eff4f0; }
+summary { font-weight: 650; cursor: pointer; }
+[hidden] { display: none !important; }
+@media (max-width: 640px) { main { padding: 1.5rem .8rem; } .panel { padding: 1rem; } .file-grid { grid-template-columns: 1fr; } th, td { min-width: 5rem; } }
+</style>
+  <script type="module">// Pure, dependency-free analysis. No network, filesystem or persistent storage.
+ const LIMITS = Object.freeze({ maxBytes: 2097152, maxRows: 10000, maxColumns: 256, maxDetails: 1000, maxPreviewDetails: 1000 });
+ const DISCLAIMER = 'This report is not Shopify import approval. It does not verify commercial prices, destination store state, or Shopify import behavior.';
+const PRICE_COLUMNS = new Set(['Price', 'Compare-at price']);
+// A3: retain these independently of the budget for other findings and UI nodes.
+const STRUCTURAL_CODES = new Set(['DUPLICATE_IDENTITY', 'HEADERS_CHANGED', 'ROW_COUNT', 'ADDED_IDENTITY', 'MISSING_IDENTITY', 'ROW_ORDER', 'IDENTITY_CHANGE']);
+const REQUIRED = ['URL handle', 'Option1 name', 'Option1 value', 'Price', 'SKU', 'Barcodes'];
+const fail = message => { throw new Error(message); };
+
+ function decodeUTF8(bytes) {
+  if (!(bytes instanceof Uint8Array)) fail('Expected UTF-8 bytes.');
+  if (bytes.byteLength > LIMITS.maxBytes) fail('File exceeds the 2 MiB limit.');
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { fail('File is not valid UTF-8. Export as UTF-8 CSV and retry.'); }
+}
+
+ function parseCSV(text) {
+  if (typeof text !== 'string') fail('Expected CSV text.');
+  if (!text.isWellFormed()) fail('Invalid Unicode text.');
+  if (new TextEncoder().encode(text).length > LIMITS.maxBytes) fail('File exceeds the 2 MiB limit.');
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text)) fail('CSV contains unsupported control characters.');
+  if (text.startsWith('\uFEFF')) text = text.slice(1);
+  if (!text) fail('CSV is empty.');
+  const rows = [];
+  let row = [], field = '', state = 'start', pending = false;
+  function endField() {
+    row.push(field);
+    if (row.length > LIMITS.maxColumns) fail('CSV exceeds 256 columns.');
+    field = ''; state = 'start';
+  }
+  function endRow() {
+    endField(); rows.push(row); row = []; pending = false;
+    if (rows.length > LIMITS.maxRows + 1) fail('CSV exceeds 10,000 data rows.');
+  }
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    pending = true;
+    if (state === 'quoted') {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else state = 'closed';
+      } else field += ch;
+      continue;
+    }
+    if (ch === ',') { endField(); continue; }
+    if (ch === '\r' || ch === '\n') {
+      if (ch === '\r') {
+        if (text[i + 1] !== '\n') fail('Malformed CSV: bare CR outside a quoted field.');
+        i++;
+      }
+      endRow(); continue;
+    }
+    if (state === 'closed') fail('Malformed CSV: unexpected text after closing quote.');
+    if (ch === '"') {
+      if (state !== 'start') fail('Malformed CSV: quote inside an unquoted field.');
+      state = 'quoted';
+    } else { field += ch; state = 'plain'; }
+  }
+  if (state === 'quoted') fail('Malformed CSV: unterminated quoted field.');
+  if (pending) endRow();
+  return rows;
+}
+
+function cents(value, column, row, source) {
+  if (value === '' && column === 'Compare-at price') return null;
+  if (!/^\d{1,12}(?:\.\d{1,2})?$/.test(value)) {
+    fail(`${source} row ${row}, ${column}: use an unsigned decimal with at most 12 integer digits and 2 fractional digits; no symbols, spaces or exponents.`);
+  }
+  const [whole, fraction = ''] = value.split('.');
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+}
+
+function readTable(text, source) {
+  let parsed;
+  try { parsed = parseCSV(text); } catch (error) { fail(`${source}: ${error.message}`); }
+  const [headers, ...rows] = parsed;
+  if (headers.some(h => !h || h.trim() !== h) || new Set(headers).size !== headers.length) {
+    fail(`${source}: empty, padded or duplicate column header.`);
+  }
+  for (const name of REQUIRED) if (!headers.includes(name)) fail(`${source}: missing required current-format header "${name}".`);
+  for (const n of [2, 3]) {
+    if (headers.includes(`Option${n} name`) !== headers.includes(`Option${n} value`)) fail(`${source}: Option${n} name/value headers must occur together.`);
+  }
+  if (!rows.length) fail(`${source}: at least one data row is required.`);
+  const index = new Map(headers.map((h, i) => [h, i]));
+  const records = rows.map((values, i) => {
+    const number = i + 2;
+    if (values.length !== headers.length) fail(`${source} row ${number}: expected ${headers.length} columns, found ${values.length}.`);
+    const get = name => index.has(name) ? values[index.get(name)] : '';
+    if (!get('URL handle').trim()) fail(`${source} row ${number}: URL handle is required on every row.`);
+    const imageOnly = get('Image src') !== '' && ['Price', 'Compare-at price', 'SKU', 'Barcodes', ...[1, 2, 3].flatMap(n => [`Option${n} name`, `Option${n} value`])].every(h => get(h) === '');
+    if (!imageOnly && !get('Option1 value').trim()) fail(`${source} row ${number}: Option1 value is required on variant rows.`);
+    const prices = {};
+    if (!imageOnly) for (const column of PRICE_COLUMNS) if (index.has(column)) prices[column] = cents(get(column), column, number, source);
+    const key = JSON.stringify(imageOnly ? ['image', get('URL handle'), get('Image src')] : ['variant', get('URL handle'), ...[1, 2, 3].map(n => get(`Option${n} value`))]);
+    const identity = imageOnly ? `${get('URL handle')} / image: ${get('Image src')}` : `${get('URL handle')} / ${[1, 2, 3].map(n => get(`Option${n} value`)).filter(Boolean).join(' / ')}`;
+    return { values, key, identity, prices, number, imageOnly };
+  });
+  return { headers, records };
+}
+
+function percent(before, after) {
+  if (before === null || after === null || before === 0n) return null;
+  const delta = after - before;
+  // Round hundredths of a percent using integer arithmetic, not binary floats.
+  const scaled = ((delta < 0n ? -delta : delta) * 10000n + before / 2n) / before;
+  return `${delta < 0n && scaled !== 0n ? '-' : ''}${scaled / 100n}.${String(scaled % 100n).padStart(2, '0')}`;
+}
+
+ function analyze(originalText, proposedText) {
+  const original = readTable(originalText, 'Original');
+  const proposed = readTable(proposedText, 'Proposed');
+  const report = {
+    schemaVersion: 1, status: 'review', disclaimer: DISCLAIMER,
+    rowNumberMeaning: 'CSV record number including the header, not physical line number.',
+    comparisonBasis: 'Positional; price details are not matched variants when structural findings exist.',
+    originalRows: original.records.length, proposedRows: proposed.records.length,
+    blockingCount: 0, warningCount: 0, priceChangeCount: 0,
+    findings: [], priceChanges: [], detailsTruncated: false,
+    findingsOmitted: 0, priceChangesOmitted: 0,
+    detailPolicy: 'All structural and identity findings are retained. Other findings and price changes are each limited to 1,000 details; omission counts exclude the separate UI preview limit.'
+  };
+  let otherFindingsRetained = 0;
+  function finding(code, message, detail = {}, severity = 'blocking') {
+    report[severity === 'blocking' ? 'blockingCount' : 'warningCount']++;
+    const structural = STRUCTURAL_CODES.has(code);
+    if (structural || otherFindingsRetained < LIMITS.maxDetails) {
+      report.findings.push({ severity, code, message, ...detail });
+      if (!structural) otherFindingsRetained++;
+    } else {
+      report.findingsOmitted++;
+      report.detailsTruncated = true;
+    }
+  }
+  const maps = [original, proposed].map((table, ti) => {
+    const map = new Map();
+    for (const record of table.records) {
+      if (map.has(record.key)) finding('DUPLICATE_IDENTITY', `${ti ? 'Proposed' : 'Original'} identity duplicates row ${map.get(record.key)}.`, { source: ti ? 'Proposed' : 'Original', row: record.number, identity: record.identity });
+      else map.set(record.key, record.number);
+    }
+    return map;
+  });
+  const headersMatch = JSON.stringify(original.headers) === JSON.stringify(proposed.headers);
+  if (!headersMatch) {
+    finding('HEADERS_CHANGED', 'Headers or their order changed; column comparison is not possible.', { before: original.headers, after: proposed.headers });
+  }
+  if (original.records.length !== proposed.records.length) finding('ROW_COUNT', 'Data row count changed.', { before: original.records.length, after: proposed.records.length });
+  for (const [ti, table] of [original, proposed].entries()) {
+    for (const record of table.records) if (!maps[1 - ti].has(record.key)) {
+      finding(ti ? 'ADDED_IDENTITY' : 'MISSING_IDENTITY', ti ? 'Identity is not present in the original.' : 'Identity is not present in the proposed file.', { source: ti ? 'Proposed' : 'Original', row: record.number, identity: record.identity });
+    }
+  }
+  for (let i = 0; i < Math.min(original.records.length, proposed.records.length); i++) {
+    const a = original.records[i], b = proposed.records[i];
+    if (a.key !== b.key) {
+      const fromRow = maps[0].get(b.key);
+      finding(fromRow !== undefined ? 'ROW_ORDER' : 'IDENTITY_CHANGE', fromRow !== undefined ? `Proposed row identity was at original row ${fromRow}; strict v1 will not rematch rows.` : 'Row identity changed.', { row: b.number, before: a.identity, after: b.identity });
+    }
+    if (!headersMatch) continue;
+    for (let c = 0; c < original.headers.length; c++) {
+      const column = original.headers[c], before = a.values[c], after = b.values[c];
+      if (before === after) continue;
+      const detail = { row: b.number, identity: a.identity, column, before, after };
+      if (!PRICE_COLUMNS.has(column)) {
+        const scientific = column === 'Barcodes' && /\d(?:\.\d+)?[eE][+-]?\d+/.test(after);
+        finding('NON_PRICE_CHANGE', scientific ? 'Non-price change: barcode resembles spreadsheet scientific notation.' : 'Non-price field changed.', detail);
+      } else if (a.imageOnly || b.imageOnly) {
+        finding('IDENTITY_CHANGE', 'Price field changed on an image-only row.', detail);
+      } else {
+        const oldPrice = a.prices[column], newPrice = b.prices[column];
+        report.priceChangeCount++;
+        if (report.priceChanges.length < LIMITS.maxDetails) report.priceChanges.push({ ...detail, percentChange: percent(oldPrice, newPrice) });
+        else {
+          report.priceChangesOmitted++;
+          report.detailsTruncated = true;
+        }
+        if (oldPrice === 0n) finding('ZERO_BASELINE', 'Percent change is undefined from a zero baseline.', detail, 'warning');
+        if (column === 'Price' && newPrice === 0n) finding('ZERO_PRICE', 'Proposed Price is zero; review manually.', detail, 'warning');
+        if (oldPrice !== null && newPrice !== null && oldPrice > 0n && (newPrice > oldPrice ? newPrice - oldPrice : oldPrice - newPrice) * 2n >= oldPrice) {
+          finding('EXTREME_PRICE_CHANGE', 'Absolute price change is at least 50%; review manually.', detail, 'warning');
+        }
+      }
+    }
+  }
+  if (report.blockingCount) report.status = 'blocked';
+  return report;
+}
+
+
+const [demoBefore, demoPriceOnly, demoBlocked] = [
+`URL handle,Title,Option1 name,Option1 value,Price,Compare-at price,SKU,Barcodes,Image src
+fictional-tee,Fictional cotton tee,Size,Small,20.00,25.00,DEMO-TEE-S,001234567890,
+fictional-tee,,Size,Large,24.00,30.00,DEMO-TEE-L,001234567891,
+fictional-mug,"Fictional mug, blue",Color,Blue,10.00,,DEMO-MUG-B,009876543210,`,
+`URL handle,Title,Option1 name,Option1 value,Price,Compare-at price,SKU,Barcodes,Image src
+fictional-tee,Fictional cotton tee,Size,Small,22.00,25.00,DEMO-TEE-S,001234567890,
+fictional-tee,,Size,Large,26.00,30.00,DEMO-TEE-L,001234567891,
+fictional-mug,"Fictional mug, blue",Color,Blue,10.00,,DEMO-MUG-B,009876543210,`,
+`URL handle,Title,Option1 name,Option1 value,Price,Compare-at price,SKU,Barcodes,Image src
+fictional-tee,Fictional cotton tee,Size,Small,22.00,25.00,DEMO-TEE-S,1.23457E+9,
+fictional-tee,,Size,Large,26.00,30.00,DEMO-TEE-L,001234567891,
+fictional-mug,"Fictional mug, blue",Color,Blue,10.00,,DEMO-MUG-B,009876543210,`
+];
+
+const byId = id => document.getElementById(id);
+const original = byId('original');
+const proposed = byId('proposed');
+let generation = 0;
+let report = null;
+let busy = false;
+const urls = new Set();
+
+function revokeDownloads() {
+  for (const url of urls) URL.revokeObjectURL(url);
+  urls.clear();
+}
+function invalidate() {
+  generation++;
+  report = null;
+  busy = false;
+  revokeDownloads();
+  byId('results').hidden = true;
+  byId('error').hidden = true;
+  byId('error').textContent = '';
+  byId('summary').textContent = '';
+  byId('findings').replaceChildren();
+  byId('prices').replaceChildren();
+  byId('download').disabled = true;
+  byId('analyze').disabled = !(original.files.length && proposed.files.length);
+  byId('status').textContent = byId('analyze').disabled ? 'Choose both files to begin.' : 'Ready to compare. No files have been uploaded.';
+}
+for (const input of [original, proposed]) input.addEventListener('change', invalidate);
+byId('clear').addEventListener('click', () => {
+  byId('compare-form').reset();
+  invalidate();
+});
+
+function render(result) {
+  byId('summary').className = result.status === 'blocked' ? 'blocked' : '';
+  byId('summary').textContent = `${result.status === 'blocked' ? 'BLOCKED — structural or non-price differences found.' : 'Comparison complete — manual review required.'} ${result.originalRows} original / ${result.proposedRows} proposed rows; ${result.blockingCount} blocking findings, ${result.warningCount} warnings, ${result.priceChangeCount} changed price fields.`;
+  const previewLimited = result.findings.length > LIMITS.maxPreviewDetails || result.priceChanges.length > LIMITS.maxPreviewDetails;
+  byId('truncation').hidden = !(previewLimited || result.detailsTruncated);
+  byId('truncation').textContent = `Preview limited to ${LIMITS.maxPreviewDetails.toLocaleString('en-US')} findings and price changes each. Download JSON for complete structural and identity findings. JSON omits ${result.findingsOmitted} other findings and ${result.priceChangesOmitted} price-change details; summary counts include all detections.`;
+  byId('findings-empty').hidden = result.findings.length > 0;
+  const findings = document.createDocumentFragment();
+  for (const finding of result.findings.slice(0, LIMITS.maxPreviewDetails)) {
+    const li = document.createElement('li');
+    const title = document.createElement('strong');
+    title.textContent = `${finding.severity.toUpperCase()} · ${finding.code}${finding.row ? ` · row ${finding.row}` : ''}${finding.column ? ` · ${finding.column}` : ''}`;
+    const message = document.createElement('p');
+    message.textContent = `${finding.identity ? `${finding.identity}: ` : ''}${finding.message}`;
+    li.append(title, message);
+    if (Object.hasOwn(finding, 'before')) {
+      const values = document.createElement('pre');
+      values.textContent = `Before: ${JSON.stringify(finding.before)}\nAfter:  ${JSON.stringify(finding.after)}`;
+      li.append(values);
+    }
+    findings.append(li);
+  }
+  byId('findings').replaceChildren(findings);
+  const prices = document.createDocumentFragment();
+  for (const change of result.priceChanges.slice(0, LIMITS.maxPreviewDetails)) {
+    const tr = document.createElement('tr');
+    for (const value of [change.row, change.identity, change.column, change.before === '' ? '(blank)' : change.before, change.after === '' ? '(blank)' : change.after, change.percentChange === null ? 'N/A' : `${change.percentChange}%`]) {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.append(td);
+    }
+    prices.append(tr);
+  }
+  byId('prices').replaceChildren(prices);
+  byId('prices-empty').hidden = result.priceChangeCount !== 0;
+  byId('results').hidden = false;
+  byId('download').disabled = false;
+  byId('result-heading').focus();
+}
+
+async function compare(demo = null) {
+  if (busy) return;
+  if (demo) byId('compare-form').reset(); // Demo needs no upload or selected files.
+  invalidate();
+  const ticket = generation;
+  const files = demo ? null : [original.files[0], proposed.files[0]];
+  busy = true;
+  byId('analyze').disabled = true;
+  byId('status').textContent = 'Reading and comparing locally…';
+  try {
+    let texts;
+    if (demo) {
+      texts = [demoBefore, demo];
+    } else {
+      if (files.some(file => !file)) throw new Error('Choose an original and a proposed CSV file.');
+      for (let i = 0; i < files.length; i++) {
+        if (files[i].size > LIMITS.maxBytes) throw new Error(`${i ? 'Proposed' : 'Original'} file exceeds 2 MiB. No comparison was produced.`);
+      }
+      texts = await Promise.all(files.map(async file => decodeUTF8(new Uint8Array(await file.arrayBuffer()))));
+    }
+    if (ticket !== generation) return; // A selection change or clear invalidates an in-flight read.
+    const result = analyze(...texts);
+    report = result;
+    render(result);
+    byId('status').textContent = result.status === 'blocked' ? 'Comparison blocked. Review findings below.' : 'Report ready for manual review — not import approval.';
+  } catch (error) {
+    if (ticket !== generation) return;
+    report = null;
+    byId('results').hidden = true;
+    byId('download').disabled = true;
+    byId('error').textContent = error.message;
+    byId('error').hidden = false;
+    byId('status').textContent = 'Analysis failed closed. No partial report is available.';
+  } finally {
+    if (ticket === generation) {
+      busy = false;
+      byId('analyze').disabled = !(original.files.length && proposed.files.length);
+    }
+  }
+}
+byId('compare-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  await compare();
+});
+byId('demo-price-only').addEventListener('click', () => compare(demoPriceOnly));
+byId('demo-blocked').addEventListener('click', () => compare(demoBlocked));
+
+byId('download').addEventListener('click', () => {
+  if (!report) return;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2) + '\n'], { type: 'application/json' }));
+  urls.add(url);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'shopify-price-review.json';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // Allow browser download handling to finish before releasing the memory URL.
+  setTimeout(() => { URL.revokeObjectURL(url); urls.delete(url); }, 60000);
+});
+
+window.addEventListener('pagehide', revokeDownloads);
+window.addEventListener('pageshow', () => {
+  byId('compare-form').reset(); // Also discard browser-restored file controls on back/forward navigation.
+  invalidate();
+});
+invalidate();
+</script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">LOCAL · READ-ONLY · SYNTHETIC PILOT</p>
+      <h1>Price edits. Nothing else.</h1>
+      <p class="lead">Compare a saved product export with a proposed price CSV before you consider an import. A comparison aid, not a commercial price recommendation.</p>
+      <p class="notice">This is <strong>not Shopify import approval</strong>. No store connection, import, rollback, or commercial price validation.</p>
+    </header>
+    <section aria-labelledby="choose-heading" class="panel">
+      <h2 id="choose-heading">1. Try fictional examples or choose two CSV files</h2>
+      <p>Try the synthetic price-only or blocked barcode example without selecting or uploading files. “Price-only” describes differences, not import approval.</p>
+      <div class="actions"><button id="demo-price-only" type="button">Compare fictional price-only example</button><button id="demo-blocked" type="button" class="secondary">Compare blocked barcode example</button></div>
+      <p>Selected files stay in this browser tab and are never uploaded. No analytics, cookies or persistent storage. Clear or reload discards app-held files and results; downloaded reports stay on your device until you remove them.</p>
+      <form id="compare-form">
+        <div class="file-grid">
+          <label for="original">Original export<input id="original" type="file" accept=".csv,text/csv" required><span>The unchanged baseline</span></label>
+          <label for="proposed">Proposed price edit<input id="proposed" type="file" accept=".csv,text/csv" required><span>Same headers and row order</span></label>
+        </div>
+        <p class="hint">UTF-8 · 2 MiB and 10,000 data rows per file · current headers only. Only Price and Compare-at price may change.</p>
+        <div class="actions"><button id="analyze" type="submit" disabled>Compare files</button><button id="clear" type="button" class="secondary">Clear files &amp; report</button></div>
+      </form>
+      <noscript><p class="notice">JavaScript is required for this local-only comparison.</p></noscript>
+      <p id="status" role="status" aria-live="polite">Choose both files to begin.</p>
+      <p id="error" role="alert" hidden></p>
+    </section>
+    <section id="results" class="panel" aria-labelledby="result-heading" hidden>
+      <h2 id="result-heading" tabindex="-1">2. Review the differences</h2>
+      <p id="summary"></p>
+      <p class="notice">Review every change against your intent. This report is not Shopify import approval and does not check your destination store.</p>
+      <p id="truncation" hidden>Preview limited to 1,000 findings and price changes each. Download JSON for complete structural and identity findings. Other report details may be limited; summary counts include all detections.</p>
+      <button id="download" type="button" class="secondary" disabled>Download review report (JSON)</button>
+      <p class="hint">The JSON report can contain selected original and proposed values. It stays on your device until you remove it; keep it private. It is not an import or rollback CSV.</p>
+      <h3>Structural findings &amp; warnings</h3>
+      <p id="findings-empty" hidden>No structural or non-price differences detected within this tool’s strict scope.</p>
+      <ol id="findings"></ol>
+      <h3>Price changes</h3>
+      <p>Rows are CSV record numbers including the header, not physical lines. Comparisons are positional; when structure is blocked, prices are <strong>not confirmed variant matches</strong>. N/A means a blank or zero baseline prevents a meaningful percentage.</p>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Price changes table">
+        <table><caption>Exact original and proposed price strings</caption><thead><tr><th scope="col">Row</th><th scope="col">Identity</th><th scope="col">Column</th><th scope="col">Before</th><th scope="col">After</th><th scope="col">Change %</th></tr></thead><tbody id="prices"></tbody></table>
+      </div>
+      <p id="prices-empty" hidden>No price fields changed.</p>
+    </section>
+    <details class="panel"><summary>Supported scope &amp; limitations</summary>
+      <p>Required exact headers: URL handle, Option1 name, Option1 value, Price, SKU, Barcodes. Compare-at price is optional. Option2 and Option3 name/value headers must occur in pairs. Additional columns are preserved and compared as text; legacy headers are not translated.</p>
+      <p>Each variant must have a handle and Option1 value. Image-only rows require Image src and blank prices, SKU, Barcodes and option fields. Ambiguous identities block review. CSV field quoting may differ, but decoded values must match outside price columns. See the local README.md for the full strict-v1 limits and local launch instructions.</p>
+      <p>The embedded fictional examples are synthetic; “proposed-safe.csv” is a price-only fixture name, never import approval. No verified buyer, merchant purchase intent, income, or real Shopify import test exists. Not affiliated with Shopify. Browser scope: desktop Google Chrome only. Other browsers and physical mobile devices have not been tested.</p>
+    </details>
+    <footer class="panel">
+      <p>Local information: <a href="README.md">README.md</a> · <a href="LICENSE.txt">LICENSE.txt</a> · <a href="NOTICE.md">NOTICE.md</a> · <a href="SUPPORT.md">SUPPORT.md</a>.</p>
+      <p>Planned feedback route (pending provider verification): <a href="https://github.com/Michael-laffin/shopify-price-csv-guard/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a>. Do not attach CSV exports or private data. No response is promised.</p>
+      <p>Opening a hosted page makes an ordinary request to its host, which may log visit metadata. Analysis failed closed means no partial report; review is always required.</p>
+    </footer>
+  </main>
+</body>
+</html>

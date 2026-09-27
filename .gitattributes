@@ -1,0 +1,2 @@
+# Preserve exact verified HTML/CSP and manifest bytes on every checkout.
+* -text
